@@ -14,7 +14,6 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     private readonly usersService: UsersService,
   ) {
     super({
-      // Cookie ONLY — no Authorization header, no token in localStorage
       jwtFromRequest: JwtStrategy.fromCookie,
       ignoreExpiration: false,
       secretOrKey: config.getOrThrow<string>('JWT_SECRET'),
@@ -31,11 +30,16 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException('Session is no longer valid, please log in again');
     }
 
+    // Logged in before the password was reset -> force a new login
+    if (user.passwordChangedAt && payload.iat && payload.iat * 1000 < user.passwordChangedAt.getTime()) {
+      throw new UnauthorizedException('Your password was changed. Please log in again.');
+    }
+
     return {
       id: user._id.toString(),
       name: user.name,
       email: user.email,
-      role: user.role, // always read fresh from DB, not trusted from the token
+      role: user.role,
     };
   }
 }

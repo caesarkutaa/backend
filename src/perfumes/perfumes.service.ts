@@ -30,6 +30,7 @@ const SORT_STAGES: Record<PerfumeSort, Record<string, 1 | -1>> = {
   [PerfumeSort.PRICE_DESC]: { minPrice: -1, _id: 1 },
   [PerfumeSort.NAME_ASC]: { name: 1, _id: 1 },
   [PerfumeSort.BEST_SELLING]: { totalSold: -1, createdAt: -1, _id: -1 },
+  [PerfumeSort.TOP_RATED]: { ratingAverage: -1, ratingCount: -1, _id: -1 },
 };
 
 @Injectable()
@@ -57,7 +58,6 @@ export class PerfumesService {
     await this.getCategoryOrFail(dto.category);
     this.assertValidVariants(dto.variants);
 
-    // Slug is created ONCE and never changes -> printed QR stickers never break
     const slug = await generateUniqueSlug(this.perfumeModel, `${brand.name} ${dto.name}`);
     const variants = this.normalizeVariants(dto.variants, slug);
 
@@ -77,10 +77,7 @@ export class PerfumesService {
       });
       return this.findOneAdmin(perfume._id.toString());
     } catch (error) {
-      await this.cloudinary.deleteImages([
-        ...images.map((img) => img.publicId),
-        qrCode.publicId,
-      ]);
+      await this.cloudinary.deleteImages([...images.map((img) => img.publicId), qrCode.publicId]);
       throw error;
     }
   }
@@ -92,24 +89,16 @@ export class PerfumesService {
     const { page, limit, search, sort } = query;
     const match: Record<string, any> = { isActive: true };
 
-    // Brand filter (slugs -> ids)
     if (query.brand) {
       const slugs = this.splitList(query.brand);
-      const brands = await this.brandModel
-        .find({ slug: { $in: slugs }, isActive: true })
-        .select('_id')
-        .exec();
+      const brands = await this.brandModel.find({ slug: { $in: slugs }, isActive: true }).select('_id').exec();
       if (!brands.length) return this.emptyPage(page, limit);
       match.brand = { $in: brands.map((b) => b._id) };
     }
 
-    // Category filter (slugs -> ids)
     if (query.category) {
       const slugs = this.splitList(query.category);
-      const categories = await this.categoryModel
-        .find({ slug: { $in: slugs }, isActive: true })
-        .select('_id')
-        .exec();
+      const categories = await this.categoryModel.find({ slug: { $in: slugs }, isActive: true }).select('_id').exec();
       if (!categories.length) return this.emptyPage(page, limit);
       match.category = { $in: categories.map((c) => c._id) };
     }
@@ -118,7 +107,6 @@ export class PerfumesService {
     if (query.concentration) match.concentration = query.concentration;
     if (query.featured !== undefined) match.isFeatured = query.featured;
 
-    // Price range: at least one size must fall in the range
     if (query.minPrice !== undefined || query.maxPrice !== undefined) {
       const price: Record<string, number> = {};
       if (query.minPrice !== undefined) price.$gte = query.minPrice;
@@ -126,14 +114,10 @@ export class PerfumesService {
       match.variants = { $elemMatch: { price } };
     }
 
-    // Search: name, family, notes, or brand name (partial match)
     if (search?.trim()) {
       const pattern = escapeRegex(search.trim());
       const regex = { $regex: pattern, $options: 'i' };
-      const matchingBrands = await this.brandModel
-        .find({ name: new RegExp(pattern, 'i') })
-        .select('_id')
-        .exec();
+      const matchingBrands = await this.brandModel.find({ name: new RegExp(pattern, 'i') }).select('_id').exec();
 
       match.$or = [
         { name: regex },
@@ -141,9 +125,7 @@ export class PerfumesService {
         { 'notes.top': regex },
         { 'notes.middle': regex },
         { 'notes.base': regex },
-        ...(matchingBrands.length
-          ? [{ brand: { $in: matchingBrands.map((b) => b._id) } }]
-          : []),
+        ...(matchingBrands.length ? [{ brand: { $in: matchingBrands.map((b) => b._id) } }] : []),
       ];
     }
 
@@ -195,8 +177,10 @@ export class PerfumesService {
                 fragranceFamily: 1,
                 isFeatured: 1,
                 totalSold: 1,
+                ratingAverage: 1,
+                ratingCount: 1,
                 createdAt: 1,
-                images: { $slice: ['$images', 2] }, // cover + hover image
+                images: { $slice: ['$images', 2] },
                 'variants._id': 1,
                 'variants.size': 1,
                 'variants.price': 1,
@@ -224,7 +208,7 @@ export class PerfumesService {
   }
 
   /* =====================================================================
-   *  PUBLIC DETAIL  (the page the QR code opens)
+   *  PUBLIC DETAIL
    * ===================================================================*/
   async findBySlug(slug: string): Promise<PerfumeDocument> {
     const perfume = await this.perfumeModel
@@ -251,7 +235,7 @@ export class PerfumesService {
         isActive: true,
         $or: [{ category: perfume.category }, { brand: perfume.brand }],
       })
-      .select('name slug brand gender concentration images variants isFeatured')
+      .select('name slug brand gender concentration images variants isFeatured ratingAverage ratingCount')
       .populate('brand', 'name slug')
       .sort({ totalSold: -1, createdAt: -1 })
       .limit(Math.min(limit, 12))
@@ -299,7 +283,6 @@ export class PerfumesService {
     return perfume;
   }
 
-  /** Full perfume for the admin edit page, including QR link + download URL */
   async findOneAdmin(id: string) {
     if (!isObjectId(id)) throw new NotFoundException('Perfume not found');
     const perfume = await this.perfumeModel
@@ -347,8 +330,7 @@ export class PerfumesService {
     const perfume = await this.findById(id);
     if (perfume.images.length + files.length > MAX_PERFUME_IMAGES) {
       throw new BadRequestException(
-        `A perfume can have at most ${MAX_PERFUME_IMAGES} images ` +
-          `(currently ${perfume.images.length})`,
+        `A perfume can have at most ${MAX_PERFUME_IMAGES} images (currently ${perfume.images.length})`,
       );
     }
 
@@ -373,15 +355,10 @@ export class PerfumesService {
     if (!exists) throw new NotFoundException('Image not found on this perfume');
 
     if (perfume.images.length <= 1) {
-      throw new BadRequestException(
-        'A perfume must keep at least one image. Upload a new one before removing this.',
-      );
+      throw new BadRequestException('A perfume must keep at least one image. Upload a new one before removing this.');
     }
 
-    perfume.set(
-      'images',
-      this.plainImages(perfume.images).filter((img) => img.publicId !== publicId),
-    );
+    perfume.set('images', this.plainImages(perfume.images).filter((img) => img.publicId !== publicId));
     await perfume.save();
     await this.cloudinary.deleteImage(publicId);
 
@@ -398,9 +375,7 @@ export class PerfumesService {
       new Set(publicIds).size === publicIds.length &&
       publicIds.every((pid) => currentIds.includes(pid));
 
-    if (!sameSet) {
-      throw new BadRequestException('publicIds must contain exactly the current images');
-    }
+    if (!sameSet) throw new BadRequestException('publicIds must contain exactly the current images');
 
     const byId = new Map(current.map((img) => [img.publicId, img]));
     perfume.set('images', publicIds.map((pid) => byId.get(pid)));
@@ -414,13 +389,10 @@ export class PerfumesService {
    * ===================================================================*/
   async getQrCode(id: string) {
     const perfume = await this.findById(id);
-
-    // Backfill: if a perfume somehow has no QR, create it now
     if (!perfume.qrCode?.url) {
       perfume.qrCode = await this.qrCode.generateForPerfume(perfume.slug);
       await perfume.save();
     }
-
     return this.qrInfo(perfume);
   }
 
@@ -430,33 +402,25 @@ export class PerfumesService {
     return { fileName: `qr-${perfume.slug}`, svg };
   }
 
-  /** Use after changing FRONTEND_URL (e.g. localhost -> real domain) */
   async regenerateQrCode(id: string) {
     const perfume = await this.findById(id);
-    perfume.qrCode = await this.qrCode.generateForPerfume(perfume.slug); // overwrites same file
+    perfume.qrCode = await this.qrCode.generateForPerfume(perfume.slug);
     await perfume.save();
     return this.qrInfo(perfume);
   }
 
   /* =====================================================================
-   *  DELETE  (with Cloudinary + cart cleanup)
+   *  DELETE
    * ===================================================================*/
   async remove(id: string) {
     const perfume = await this.findById(id);
-
-    const publicIds = [
-      ...perfume.images.map((img) => img.publicId),
-      perfume.qrCode?.publicId,
-    ];
+    const publicIds = [...perfume.images.map((img) => img.publicId), perfume.qrCode?.publicId];
 
     await perfume.deleteOne();
-
-    // Remove from every cart (past orders keep their own snapshot)
     await this.cartModel.updateMany(
       { 'items.perfume': perfume._id },
       { $pull: { items: { perfume: perfume._id } } },
     );
-
     await this.cloudinary.deleteImages(publicIds);
 
     return {
@@ -486,17 +450,13 @@ export class PerfumesService {
     if (new Set(sizes).size !== sizes.length) {
       throw new BadRequestException('Each variant must have a different size');
     }
-
     for (const v of variants) {
       if (v.compareAtPrice !== undefined && v.compareAtPrice <= v.price) {
-        throw new BadRequestException(
-          `compareAtPrice for ${v.size}ml must be higher than its price`,
-        );
+        throw new BadRequestException(`compareAtPrice for ${v.size}ml must be higher than its price`);
       }
     }
   }
 
-  /** Keeps existing _ids (so carts stay valid) and auto-fills missing SKUs */
   private normalizeVariants(variants: VariantDto[], slug: string) {
     return variants.map((v) => ({
       ...(v._id ? { _id: new Types.ObjectId(v._id) } : {}),
@@ -516,26 +476,17 @@ export class PerfumesService {
     return {
       qrCode: perfume.qrCode,
       link: this.qrCode.buildPerfumeUrl(perfume.slug),
-      downloadUrl: perfume.qrCode
-        ? this.qrCode.getDownloadUrl(perfume.qrCode, `qr-${perfume.slug}`)
-        : null,
+      downloadUrl: perfume.qrCode ? this.qrCode.getDownloadUrl(perfume.qrCode, `qr-${perfume.slug}`) : null,
     };
   }
 
   private withQrInfo(perfume: PerfumeDocument) {
     const info = this.qrInfo(perfume);
-    return {
-      ...perfume.toJSON(),
-      qrLink: info.link,
-      qrDownloadUrl: info.downloadUrl,
-    };
+    return { ...perfume.toJSON(), qrLink: info.link, qrDownloadUrl: info.downloadUrl };
   }
 
   private splitList(value: string): string[] {
-    return value
-      .split(',')
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean);
+    return value.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
   }
 
   private emptyPage(page: number, limit: number) {

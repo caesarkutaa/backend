@@ -11,12 +11,9 @@ export enum PerfumeSort {
   PRICE_DESC = 'price_desc',
   NAME_ASC = 'name_asc',
   BEST_SELLING = 'best_selling',
+  TOP_RATED = 'top_rated',
 }
 
-/**
- * Public gallery query, e.g.
- * /perfumes?brand=dior,chanel&category=woody&gender=men&minPrice=20000&maxPrice=80000&sort=price_asc
- */
 export class PerfumeQueryDto extends PaginationQueryDto {
   /** Comma-separated brand slugs */
   @IsOptional()

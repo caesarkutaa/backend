@@ -227,7 +227,7 @@ export class CartService {
       .findOneAndUpdate(
         { user: userId },
         { $setOnInsert: { user: userId, items: [] } },
-        { upsert: true, new: true },
+        { upsert: true, returnDocument: 'after'  },
       )
       .exec();
     return cart!;

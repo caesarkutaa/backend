@@ -25,19 +25,18 @@ export class FragranceNotes {
 export const FragranceNotesSchema = SchemaFactory.createForClass(FragranceNotes);
 
 /* ---------- Size / price variant ---------- */
-// Keeps its own _id so cart & order items can point at an exact variant
 @Schema()
 export class Variant {
   _id: Types.ObjectId;
 
   @Prop({ required: true, min: 1 })
-  size: number; // in ml, e.g. 50, 100
+  size: number; // ml
 
   @Prop({ required: true, min: 0 })
-  price: number; // in Naira
+  price: number; // Naira
 
   @Prop({ min: 0 })
-  compareAtPrice?: number; // old price, for showing discounts
+  compareAtPrice?: number;
 
   @Prop({ required: true, min: 0, default: 0 })
   stock: number;
@@ -58,7 +57,7 @@ export class Perfume {
   name: string;
 
   @Prop({ required: true, unique: true, lowercase: true, trim: true })
-  slug: string; // used in the QR link: FRONTEND_URL/perfumes/:slug
+  slug: string;
 
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'Brand', required: true })
   brand: Types.ObjectId;
@@ -79,7 +78,7 @@ export class Perfume {
   concentration: Concentration;
 
   @Prop({ trim: true })
-  fragranceFamily?: string; // e.g. "Amber Woody"
+  fragranceFamily?: string;
 
   @Prop({ type: FragranceNotesSchema, default: () => ({}) })
   notes: FragranceNotes;
@@ -103,7 +102,7 @@ export class Perfume {
   images: Image[];
 
   @Prop({ type: ImageSchema })
-  qrCode?: Image; // generated automatically on create
+  qrCode?: Image;
 
   @Prop({ default: false })
   isFeatured: boolean;
@@ -113,6 +112,13 @@ export class Perfume {
 
   @Prop({ default: 0, min: 0 })
   totalSold: number;
+
+  /** Kept in sync by ReviewsService (visible reviews only) */
+  @Prop({ default: 0, min: 0, max: 5 })
+  ratingAverage: number;
+
+  @Prop({ default: 0, min: 0 })
+  ratingCount: number;
 
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'User' })
   createdBy?: Types.ObjectId;
@@ -124,6 +130,7 @@ export const PerfumeSchema = SchemaFactory.createForClass(Perfume);
 PerfumeSchema.index({ name: 'text', description: 'text', fragranceFamily: 'text' });
 PerfumeSchema.index({ brand: 1, category: 1, gender: 1, isActive: 1 });
 PerfumeSchema.index({ isFeatured: 1, isActive: 1 });
+PerfumeSchema.index({ ratingAverage: -1, ratingCount: -1 });
 
 /* ---------- Virtuals ---------- */
 PerfumeSchema.virtual('minPrice').get(function (this: Perfume) {

@@ -10,20 +10,27 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectModel } from '@nestjs/mongoose';
 import { isValidObjectId, Model } from 'mongoose';
+import { createHash, randomBytes } from 'crypto';
 import * as argon2 from 'argon2';
 import { User, UserDocument } from './schemas/user.schema';
 import { Role } from '../common/enums/role.enum';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 
+const RESET_COOLDOWN_MS = 60_000;
+const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
+
 @Injectable()
 export class UsersService implements OnModuleInit {
   private readonly logger = new Logger(UsersService.name);
+  readonly resetTokenTtlMinutes: number;
 
   constructor(
     @InjectModel(User.name) private readonly userModel: Model<User>,
     private readonly config: ConfigService,
-  ) {}
+  ) {
+    this.resetTokenTtlMinutes = Number(config.get('RESET_TOKEN_TTL_MINUTES') ?? 30);
+  }
 
   /* ---------- Admin seed (runs on app start) ---------- */
   async onModuleInit() {
@@ -77,7 +84,7 @@ export class UsersService implements OnModuleInit {
       ...data,
       email,
       password: await this.hashPassword(data.password),
-      role: Role.CUSTOMER, // public registration can never create admins
+      role: Role.CUSTOMER,
     });
   }
 
@@ -92,6 +99,59 @@ export class UsersService implements OnModuleInit {
   async findActiveById(id: string): Promise<UserDocument | null> {
     if (!isValidObjectId(id)) return null;
     return this.userModel.findOne({ _id: id, isActive: true }).exec();
+  }
+
+  /* ---------- Forgot / reset password ---------- */
+
+  /**
+   * Creates a one-time reset token. Returns null (silently) if the email is unknown,
+   * the account is blocked, or a link was sent less than a minute ago.
+   */
+  async createPasswordResetToken(email: string): Promise<{ user: UserDocument; token: string } | null> {
+    const user = await this.userModel.findOne({ email: email.trim().toLowerCase(), isActive: true }).exec();
+    if (!user) return null;
+
+    if (
+      user.passwordResetRequestedAt &&
+      Date.now() - user.passwordResetRequestedAt.getTime() < RESET_COOLDOWN_MS
+    ) {
+      return null;
+    }
+
+    const token = randomBytes(32).toString('hex'); // 64 hex chars
+    user.passwordResetTokenHash = hashToken(token);
+    user.passwordResetExpires = new Date(Date.now() + this.resetTokenTtlMinutes * 60_000);
+    user.passwordResetRequestedAt = new Date();
+    await user.save();
+
+    return { user, token };
+  }
+
+  findByResetToken(token: string): Promise<UserDocument | null> {
+    if (!/^[a-f0-9]{64}$/i.test(token ?? '')) return Promise.resolve(null);
+    return this.userModel
+      .findOne({
+        passwordResetTokenHash: hashToken(token),
+        passwordResetExpires: { $gt: new Date() },
+        isActive: true,
+      })
+      .select('+passwordResetTokenHash +passwordResetExpires')
+      .exec();
+  }
+
+  async resetPassword(token: string, newPassword: string): Promise<UserDocument> {
+    const user = await this.findByResetToken(token);
+    if (!user) {
+      throw new BadRequestException('This reset link is invalid or has expired. Please request a new one.');
+    }
+
+    user.password = await this.hashPassword(newPassword);
+    user.passwordResetTokenHash = undefined; // one-time use
+    user.passwordResetExpires = undefined;
+    user.passwordChangedAt = new Date(Date.now() - 1000); // sign out every existing session
+    await user.save();
+
+    return user;
   }
 
   /* ---------- Profile ---------- */

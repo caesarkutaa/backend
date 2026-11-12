@@ -15,6 +15,8 @@ import { CartService } from '../cart/cart.service';
 import { PaymentsService } from '../payments/payments.service';
 import { PaystackService } from '../payments/paystack.service';
 import { CloudinaryService } from '../cloudinary/cloudinary.service';
+import { EventsService, OrderEventKind } from '../events/events.service';
+import { SettingsService } from '../settings/settings.service';
 import { BankAccountDocument } from '../payments/schemas/bank-account.schema';
 import {
   OrderStatus,
@@ -28,7 +30,6 @@ import { UpdateOrderStatusDto } from './dto/update-order-status.dto';
 import { OrderQueryDto } from './dto/order-query.dto';
 import { escapeRegex, isObjectId } from '../common/utils/object.util';
 
-/** Allowed manual status changes by admin (PROCESSING only comes from payment) */
 const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   [OrderStatus.PENDING]: [OrderStatus.CANCELLED],
   [OrderStatus.PROCESSING]: [OrderStatus.SHIPPED, OrderStatus.CANCELLED],
@@ -42,17 +43,17 @@ type StockLine = Pick<OrderItem, 'perfume' | 'variantId' | 'quantity' | 'name' |
 interface MarkPaidOptions {
   method: PaymentMethod;
   note: string;
-  adminId?: string; // set when an admin confirms a bank transfer
-  reference?: string; // Paystack reference that succeeded
+  adminId?: string;
+  reference?: string;
   channel?: string;
 }
+
+const naira = (amount: number) => `₦${amount.toLocaleString('en-NG')}`;
 
 @Injectable()
 export class OrdersService {
   private readonly logger = new Logger(OrdersService.name);
   private readonly paymentWindowHours: number;
-  private readonly shippingFee: number;
-  private readonly freeShippingMin: number;
   private readonly frontendUrl: string;
 
   constructor(
@@ -63,11 +64,11 @@ export class OrdersService {
     private readonly paymentsService: PaymentsService,
     private readonly paystack: PaystackService,
     private readonly cloudinary: CloudinaryService,
+    private readonly events: EventsService,
+    private readonly settings: SettingsService,
     config: ConfigService,
   ) {
     this.paymentWindowHours = Number(config.get('ORDER_PAYMENT_WINDOW_HOURS') ?? 24);
-    this.shippingFee = Number(config.get('SHIPPING_FEE') ?? 0);
-    this.freeShippingMin = Number(config.get('FREE_SHIPPING_MIN') ?? 0);
     this.frontendUrl = config
       .get<string>('FRONTEND_URL', 'http://localhost:3000')
       .replace(/\/+$/, '');
@@ -82,7 +83,6 @@ export class OrdersService {
     const user = await this.userModel.findById(userId).lean().exec();
     if (!user) throw new NotFoundException('User not found');
 
-    // Make sure the chosen method is actually available BEFORE touching stock
     let bankAccounts: BankAccountDocument[] = [];
     if (method === PaymentMethod.BANK_TRANSFER) {
       bankAccounts = await this.paymentsService.findActiveAccounts();
@@ -102,7 +102,6 @@ export class OrdersService {
       throw new BadRequestException('Please provide a shipping address');
     }
 
-    // Throws if empty, changed, or has out-of-stock items
     const cart = await this.cartService.getCartForCheckout(userId);
 
     const items: OrderItem[] = cart.items.map((item) => ({
@@ -117,10 +116,10 @@ export class OrdersService {
       subtotal: item.unitPrice * item.quantity,
     }));
 
-    await this.reserveStock(items);
-
     const subtotal = items.reduce((sum, i) => sum + i.subtotal, 0);
-    const shippingFee = this.calculateShipping(subtotal);
+    const shippingFee = await this.settings.calculateShippingFee(shippingAddress.state, subtotal);
+
+    await this.reserveStock(items);
 
     let order: OrderDocument;
     try {
@@ -143,7 +142,6 @@ export class OrdersService {
       throw error;
     }
 
-    // Paystack: get the checkout link. If Paystack is down, undo the order (cart is untouched).
     let paystackPayment: Awaited<ReturnType<OrdersService['startPaystackPayment']>> | null = null;
     if (method === PaymentMethod.PAYSTACK) {
       try {
@@ -163,6 +161,12 @@ export class OrdersService {
       );
     }
 
+    this.notify(order, {
+      kind: 'order.placed',
+      actorId: userId,
+      admin: `New order ${order.orderNumber} · ${naira(order.total)}`,
+    });
+
     return {
       order,
       payment:
@@ -175,8 +179,6 @@ export class OrdersService {
   /* =====================================================================
    *  PAYSTACK
    * ===================================================================*/
-
-  /** Retry Paystack (closed tab) or switch an unpaid bank-transfer order to Paystack */
   async payWithPaystack(userId: string, orderId: string) {
     const order = await this.findUserOrder(userId, orderId);
     this.assertPayable(order);
@@ -187,7 +189,6 @@ export class OrdersService {
     return this.startPaystackPayment(order, user.email);
   }
 
-  /** Called by the frontend callback page: /orders/:id/payment/verify?reference=... */
   async verifyPaystackForUser(userId: string, reference: string) {
     if (!reference) throw new BadRequestException('Payment reference is required');
 
@@ -208,10 +209,6 @@ export class OrdersService {
     };
   }
 
-  /**
-   * The single place a Paystack payment is confirmed (used by callback, webhook and expiry job).
-   * Always re-verifies with Paystack — never trusts the request alone.
-   */
   async processPaystackReference(
     reference: string,
     source: 'callback' | 'webhook' | 'expiry-check',
@@ -222,7 +219,7 @@ export class OrdersService {
       return null;
     }
 
-    if (order.paymentStatus === PaymentStatus.PAID) return order; // already handled
+    if (order.paymentStatus === PaymentStatus.PAID) return order;
 
     const tx = await this.paystack.verify(reference);
     if (tx.status !== 'success') return order;
@@ -235,9 +232,13 @@ export class OrdersService {
       this.addHistory(
         order,
         order.paymentStatus,
-        `Paystack amount mismatch: received ₦${(tx.amount / 100).toLocaleString('en-NG')} — needs review`,
+        `Paystack amount mismatch: received ${naira(tx.amount / 100)} — needs review`,
       );
       await order.save();
+      this.notify(order, {
+        kind: 'payment.mismatch',
+        admin: `⚠️ Paystack amount mismatch on ${order.orderNumber}`,
+      });
       return order;
     }
 
@@ -256,7 +257,6 @@ export class OrdersService {
   private async startPaystackPayment(order: OrderDocument, email: string) {
     const reference = `${order.orderNumber}-${Date.now().toString(36).toUpperCase()}`;
 
-    // Save the reference first so a webhook can always find this order
     order.paymentReferences.push(reference);
     order.paymentMethod = PaymentMethod.PAYSTACK;
     await order.save();
@@ -281,7 +281,6 @@ export class OrdersService {
     };
   }
 
-  /** Money arrived after the order expired: reopen it if stock allows, else flag for refund */
   private async handleLatePaystackPayment(
     order: OrderDocument,
     reference: string,
@@ -315,6 +314,11 @@ export class OrdersService {
       );
       await order.save();
       this.logger.error(`Refund required for ${order.orderNumber} (${reference})`);
+      this.notify(order, {
+        kind: 'payment.refund_required',
+        user: `We received your payment for ${order.orderNumber}, but the items sold out. A refund is on the way.`,
+        admin: `⚠️ Refund required for ${order.orderNumber}`,
+      });
       return order;
     }
   }
@@ -380,7 +384,7 @@ export class OrdersService {
       uploadedAt: new Date(),
     } as PaymentProof);
 
-    order.paymentMethod = PaymentMethod.BANK_TRANSFER; // customer chose transfer
+    order.paymentMethod = PaymentMethod.BANK_TRANSFER;
     order.paymentStatus = PaymentStatus.AWAITING_CONFIRMATION;
     order.paymentRejectionReason = undefined;
     this.addHistory(order, PaymentStatus.AWAITING_CONFIRMATION, 'Payment proof uploaded', userId);
@@ -391,6 +395,12 @@ export class OrdersService {
       await this.cloudinary.deleteImage(image.publicId);
       throw error;
     }
+
+    this.notify(order, {
+      kind: 'payment.proof_uploaded',
+      actorId: userId,
+      admin: `🔔 New payment proof for ${order.orderNumber} · ${naira(order.total)}`,
+    });
 
     return order;
   }
@@ -495,7 +505,6 @@ export class OrdersService {
     return order;
   }
 
-  /** Admin confirms a bank transfer (also allowed if money arrived without a screenshot) */
   async confirmPayment(adminId: string, orderId: string) {
     const order = await this.findOrderById(orderId);
 
@@ -540,10 +549,18 @@ export class OrdersService {
     order.paymentRejectionReason = reason;
     order.paymentReviewedBy = new Types.ObjectId(adminId);
     order.paymentReviewedAt = new Date();
-    order.paymentDeadline = this.newDeadline(); // time to re-upload or pay with card
+    order.paymentDeadline = this.newDeadline();
     this.addHistory(order, PaymentStatus.REJECTED, `Payment proof rejected: ${reason}`, adminId);
 
     await order.save();
+
+    this.notify(order, {
+      kind: 'payment.rejected',
+      actorId: adminId,
+      user: `Your payment proof for ${order.orderNumber} was not accepted: ${reason}`,
+      admin: `Payment proof rejected for ${order.orderNumber}`,
+    });
+
     return this.findOneAdmin(orderId);
   }
 
@@ -568,6 +585,17 @@ export class OrdersService {
     this.addHistory(order, dto.status, dto.note, adminId);
 
     await order.save();
+
+    const shipped = dto.status === OrderStatus.SHIPPED;
+    this.notify(order, {
+      kind: shipped ? 'order.shipped' : 'order.delivered',
+      actorId: adminId,
+      user: shipped
+        ? `🚚 Your order ${order.orderNumber} has been shipped`
+        : `📦 Your order ${order.orderNumber} has been delivered`,
+      admin: `Order ${order.orderNumber} marked as ${dto.status}`,
+    });
+
     return this.findOneAdmin(orderId);
   }
 
@@ -641,7 +669,6 @@ export class OrdersService {
     let cancelled = 0;
     for (const order of expired) {
       try {
-        // Last chance: maybe they paid on Paystack but the webhook/callback never arrived
         if (order.paymentReferences.length && this.paystack.isEnabled()) {
           const lastRef = order.paymentReferences[order.paymentReferences.length - 1];
           const checked = await this.processPaystackReference(lastRef, 'expiry-check');
@@ -664,11 +691,31 @@ export class OrdersService {
   /* =====================================================================
    *  HELPERS
    * ===================================================================*/
+  private notify(
+    order: Pick<Order, 'orderNumber' | 'paymentStatus' | 'orderStatus'> & {
+      _id: Types.ObjectId;
+      user: Types.ObjectId | { _id: Types.ObjectId };
+    },
+    messages: { kind: OrderEventKind; user?: string; admin?: string; actorId?: string },
+  ) {
+    const rawUser = order.user as any;
+    const userId = (rawUser?._id ?? rawUser)?.toString();
 
-  /**
-   * Atomic "claim": only ONE caller (webhook, callback or admin) can flip an order to PAID,
-   * so totalSold is never incremented twice.
-   */
+    this.events.emit({
+      type: 'order.updated',
+      kind: messages.kind,
+      userId,
+      toAdmins: true,
+      actorId: messages.actorId,
+      orderId: order._id.toString(),
+      orderNumber: order.orderNumber,
+      paymentStatus: order.paymentStatus,
+      orderStatus: order.orderStatus,
+      userMessage: messages.user,
+      adminMessage: messages.admin,
+    });
+  }
+
   private async markAsPaid(
     orderId: Types.ObjectId,
     opts: MarkPaidOptions,
@@ -709,20 +756,27 @@ export class OrdersService {
           },
         },
         {
-          new: true,
+           returnDocument: 'after' ,
           ...(opts.adminId ? { arrayFilters: [{ 'proof.status': ProofStatus.PENDING }] } : {}),
         },
       )
       .exec();
 
     if (!paid) {
-      // Someone else already marked it paid (or it was cancelled) — just return current state
       const current = await this.orderModel.findById(orderId).exec();
       if (!current) throw new NotFoundException('Order not found');
       return current;
     }
 
     await this.adjustTotalSold(paid.items, 1);
+
+    this.notify(paid, {
+      kind: 'payment.confirmed',
+      actorId: opts.adminId,
+      user: `🎉 Payment confirmed for ${paid.orderNumber}. We’re preparing your order.`,
+      admin: `💰 Payment received for ${paid.orderNumber} · ${naira(paid.total)}`,
+    });
+
     return paid;
   }
 
@@ -760,14 +814,13 @@ export class OrdersService {
     }
   }
 
-  /** Cancels, restores stock once, and reverses sales if it was already paid */
   private async cancelOrder(order: OrderDocument, reason: string, byUserId?: string) {
     const wasPaid = order.paymentStatus === PaymentStatus.PAID;
 
     order.orderStatus = OrderStatus.CANCELLED;
     order.cancelledAt = new Date();
     order.cancelReason = reason;
-    if (wasPaid) order.paymentStatus = PaymentStatus.REFUNDED; // refund handled manually / on Paystack dashboard
+    if (wasPaid) order.paymentStatus = PaymentStatus.REFUNDED;
 
     if (!order.stockRestored) {
       await this.restoreStockFor(order.items);
@@ -778,9 +831,15 @@ export class OrdersService {
     await order.save();
 
     if (wasPaid) await this.adjustTotalSold(order.items, -1);
+
+    this.notify(order, {
+      kind: 'order.cancelled',
+      actorId: byUserId,
+      user: `Order ${order.orderNumber} was cancelled — ${reason}`,
+      admin: `Order ${order.orderNumber} cancelled${wasPaid ? ' (refund needed)' : ''}`,
+    });
   }
 
-  /** Conditional decrement per line — two customers can never buy the same last bottle */
   private async reserveStock(lines: StockLine[]) {
     const reserved: StockLine[] = [];
 
@@ -838,11 +897,6 @@ export class OrdersService {
     });
   }
 
-  private calculateShipping(subtotal: number): number {
-    if (this.freeShippingMin > 0 && subtotal >= this.freeShippingMin) return 0;
-    return this.shippingFee; // SHIPPING_FEE=0 -> always free
-  }
-
   private newDeadline(): Date {
     return new Date(Date.now() + this.paymentWindowHours * 60 * 60 * 1000);
   }
@@ -857,7 +911,7 @@ export class OrdersService {
       deadline: order.paymentDeadline,
       bankAccounts,
       message:
-        `Transfer exactly ₦${order.total.toLocaleString('en-NG')} to any of the accounts below. ` +
+        `Transfer exactly ${naira(order.total)} to any of the accounts below. ` +
         `Use "${order.orderNumber}" as your transfer narration, then upload a screenshot ` +
         `of your payment receipt before ${deadline}.`,
     };

@@ -5,6 +5,7 @@ import {
   HttpCode,
   HttpStatus,
   Post,
+  Query,
   Res,
   UseGuards,
 } from '@nestjs/common';
@@ -13,6 +14,8 @@ import type { CookieOptions, Response } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
 import { AUTH_COOKIE } from './auth.constants';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -26,13 +29,10 @@ export class AuthController {
   ) {}
 
   @Post('register')
-  async register(
-    @Body() dto: RegisterDto,
-    @Res({ passthrough: true }) res: Response,
-  ) {
+  async register(@Body() dto: RegisterDto, @Res({ passthrough: true }) res: Response) {
     const { user, accessToken } = await this.authService.register(dto);
     this.setAuthCookie(res, accessToken);
-    return { user }; // token lives ONLY in the httpOnly cookie
+    return { user };
   }
 
   @Post('login')
@@ -50,20 +50,40 @@ export class AuthController {
     return { message: 'Logged out successfully' };
   }
 
-  /** Frontend calls this on load to know who is logged in (it can't read the cookie) */
   @Get('me')
   @UseGuards(JwtAuthGuard)
   me(@CurrentUser() user: AuthUser) {
     return user;
   }
 
+  /* ---------- Forgot / reset password ---------- */
+  @Post('forgot-password')
+  @HttpCode(HttpStatus.OK)
+  forgotPassword(@Body() dto: ForgotPasswordDto) {
+    return this.authService.forgotPassword(dto.email);
+  }
+
+  /** Lets the reset page show "link expired" before the user types a new password */
+  @Get('reset-password/validate')
+  validateResetToken(@Query('token') token: string) {
+    return this.authService.validateResetToken(token);
+  }
+
+  @Post('reset-password')
+  @HttpCode(HttpStatus.OK)
+  async resetPassword(@Body() dto: ResetPasswordDto, @Res({ passthrough: true }) res: Response) {
+    const result = await this.authService.resetPassword(dto.token, dto.password);
+    res.clearCookie(AUTH_COOKIE, this.baseCookieOptions()); // force a fresh login
+    return result;
+  }
+
   /* ---------- Cookie helpers ---------- */
   private baseCookieOptions(): CookieOptions {
     const isProd = this.config.get<string>('NODE_ENV') === 'production';
     return {
-      httpOnly: true, // JavaScript can't read it -> safe from XSS
-      secure: isProd, // HTTPS only in production
-      sameSite: 'lax', // blocks cross-site POSTs (CSRF) — works because of the Next.js proxy below
+      httpOnly: true,
+      secure: isProd,
+      sameSite: 'lax',
       path: '/',
     };
   }

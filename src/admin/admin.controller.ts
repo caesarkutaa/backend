@@ -8,6 +8,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { AdminService } from './admin.service';
+import { EventsService } from '../events/events.service';
 import { AdminUsersQueryDto } from './dto/admin-users-query.dto';
 import { AdminPaymentsQueryDto } from './dto/admin-payments-query.dto';
 import { BlockUserDto } from './dto/block-user.dto';
@@ -23,7 +24,10 @@ import { Role } from '../common/enums/role.enum';
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Roles(Role.ADMIN)
 export class AdminController {
-  constructor(private readonly adminService: AdminService) {}
+  constructor(
+    private readonly adminService: AdminService,
+    private readonly events: EventsService,
+  ) {}
 
   /* ---------- Dashboard ---------- */
   @Get('dashboard')
@@ -43,12 +47,15 @@ export class AdminController {
   }
 
   @Patch('users/:id/block')
-  blockUser(
+  async blockUser(
     @CurrentUser('id') adminId: string,
     @Param('id') id: string,
     @Body() dto: BlockUserDto,
   ) {
-    return this.adminService.blockUser(adminId, id, dto.reason);
+    const result = await this.adminService.blockUser(adminId, id, dto.reason);
+    // Log the user out instantly on any device they have open
+    this.events.emit({ type: 'account.blocked', userId: id, actorId: adminId, userMessage: dto.reason });
+    return result;
   }
 
   @Patch('users/:id/unblock')
@@ -57,12 +64,19 @@ export class AdminController {
   }
 
   @Patch('users/:id/role')
-  updateRole(
+  async updateRole(
     @CurrentUser('id') adminId: string,
     @Param('id') id: string,
     @Body() dto: UpdateRoleDto,
   ) {
-    return this.adminService.updateRole(adminId, id, dto.role);
+    const result = await this.adminService.updateRole(adminId, id, dto.role);
+    this.events.emit({
+      type: 'account.updated',
+      userId: id,
+      actorId: adminId,
+      userMessage: dto.role === Role.ADMIN ? 'You now have admin access' : 'Your admin access was removed',
+    });
+    return result;
   }
 
   /* ---------- Payments ---------- */

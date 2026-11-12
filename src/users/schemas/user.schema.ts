@@ -10,6 +10,8 @@ export type UserDocument = HydratedDocument<User>;
   toJSON: {
     transform: (_doc, ret: Record<string, any>) => {
       delete ret.password;
+      delete ret.passwordResetTokenHash;
+      delete ret.passwordResetExpires;
       delete ret.__v;
       return ret;
     },
@@ -34,7 +36,7 @@ export class User {
   @Prop({ type: AddressSchema })
   address?: Address;
 
-  /** false = blocked (can't log in, existing session rejected on next request) */
+  /** false = blocked */
   @Prop({ default: true })
   isActive: boolean;
 
@@ -46,6 +48,22 @@ export class User {
 
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'User' })
   blockedBy?: Types.ObjectId;
+
+  /* ---------- Password reset ---------- */
+  /** SHA-256 of the emailed token — the raw token is never stored */
+  @Prop({ select: false, index: true })
+  passwordResetTokenHash?: string;
+
+  @Prop({ select: false })
+  passwordResetExpires?: Date;
+
+  /** Used for a short cooldown between reset emails */
+  @Prop()
+  passwordResetRequestedAt?: Date;
+
+  /** Any login token issued before this time is rejected */
+  @Prop()
+  passwordChangedAt?: Date;
 }
 
 export const UserSchema = SchemaFactory.createForClass(User);
